@@ -1,0 +1,13 @@
+/build/
+/.build-tmp/
+/*.elf
+/*.nacp
+/*.nro
+/SD_jetpackjoyride_nx/
+/.re/
+/jetpackjoyride.log
+assets.nxpack
+assets.nxpack.tmp
+assets.nxidx
+assets.nxidx.tmp
+/.synth*
