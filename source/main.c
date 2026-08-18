@@ -749,6 +749,7 @@ typedef struct {
   float cursor_x, cursor_y;
   uint64_t previous_ns;
   int cursor_visible;
+  int mouse_mode; /* 1 = on-screen cursor active, 0 = full controller passthrough */
 } InputState;
 
 typedef struct { uint64_t button; int android_key; } KeyBinding;
@@ -779,6 +780,7 @@ static void input_init(InputState *input) {
   input->previous_ns = monotonic_ns();
   input->cursor_visible =
       appletGetOperationMode() == AppletOperationMode_Console;
+  input->mouse_mode = 1; /* default: keep existing on-screen cursor behavior; press ZL to toggle */
 }
 
 static void send_touch(const MortarApi *api, void *env, void *thiz, int action,
@@ -795,7 +797,21 @@ static void input_update(InputState *input, const MortarApi *api,
   const uint64_t down = padGetButtonsDown(&input->pad);
   const uint64_t up = padGetButtonsUp(&input->pad);
   const uint64_t held = padGetButtons(&input->pad);
+
+  /* ZL toggles on-screen mouse mode (edge-detect on press). Do not forward ZL as an android key. */
+  if (down & HidNpadButton_ZL) {
+    input->mouse_mode = !input->mouse_mode;
+    /* if disabling mouse mode, ensure any synthetic touch is released */
+    if (!input->mouse_mode && input->active_touch) {
+      send_touch(api, env, thiz, 1, input->last_x, input->last_y);
+      input->active_touch = 0;
+    }
+    if (!input->mouse_mode) input->cursor_visible = 0;
+  }
+
   for (size_t i = 0; i < sizeof key_bindings / sizeof key_bindings[0]; ++i) {
+    /* skip ZL since it's used for toggling mouse mode */
+    if (key_bindings[i].button == HidNpadButton_ZL) continue;
     if (down & key_bindings[i].button)
       api->key(env, thiz, key_bindings[i].android_key, 1, 0, 0);
     if (up & key_bindings[i].button)
@@ -811,37 +827,44 @@ static void input_update(InputState *input, const MortarApi *api,
   float sy = (float)stick.y / 32768.0f;
   if (sx > -0.14f && sx < 0.14f) sx = 0.0f;
   if (sy > -0.14f && sy < 0.14f) sy = 0.0f;
-  if (sx != 0.0f || sy != 0.0f) input->cursor_visible = 1;
-  input->cursor_x += sx * dt * 0.75f;
-  input->cursor_y -= sy * dt * 0.75f;
-  if (input->cursor_x < 0.0f) input->cursor_x = 0.0f;
-  if (input->cursor_x > 1.0f) input->cursor_x = 1.0f;
-  if (input->cursor_y < 0.0f) input->cursor_y = 0.0f;
-  if (input->cursor_y > 1.0f) input->cursor_y = 1.0f;
-  api->motion(env, thiz, 0, 0, sx, -sy);
 
-  int physical = 0;
-  float x = input->cursor_x, y = input->cursor_y;
-  if (hidGetTouchScreenStates(&input->touch_state, 1) > 0 &&
-      input->touch_state.count > 0) {
-    physical = 1;
-    input->cursor_visible = 0;
-    x = (float)input->touch_state.touches[0].x / 1280.0f;
-    y = (float)input->touch_state.touches[0].y / 720.0f;
-  }
-  const int button_touch = (held & (HidNpadButton_A | HidNpadButton_ZR)) != 0;
-  if (button_touch && !physical) input->cursor_visible = 1;
-  const int wanted = physical || button_touch;
-  if (wanted && !input->active_touch)
-    send_touch(api, env, thiz, 0, x, y);
-  else if (wanted)
-    send_touch(api, env, thiz, 2, x, y);
-  else if (input->active_touch)
-    send_touch(api, env, thiz, 1, input->last_x, input->last_y);
-  input->active_touch = wanted;
-  if (wanted) {
-    input->last_x = x;
-    input->last_y = y;
+  if (input->mouse_mode) {
+    if (sx != 0.0f || sy != 0.0f) input->cursor_visible = 1;
+    input->cursor_x += sx * dt * 0.75f;
+    input->cursor_y -= sy * dt * 0.75f;
+    if (input->cursor_x < 0.0f) input->cursor_x = 0.0f;
+    if (input->cursor_x > 1.0f) input->cursor_x = 1.0f;
+    if (input->cursor_y < 0.0f) input->cursor_y = 0.0f;
+    if (input->cursor_y > 1.0f) input->cursor_y = 1.0f;
+    api->motion(env, thiz, 0, 0, sx, -sy);
+
+    int physical = 0;
+    float x = input->cursor_x, y = input->cursor_y;
+    if (hidGetTouchScreenStates(&input->touch_state, 1) > 0 &&
+        input->touch_state.count > 0) {
+      physical = 1;
+      input->cursor_visible = 0;
+      x = (float)input->touch_state.touches[0].x / 1280.0f;
+      y = (float)input->touch_state.touches[0].y / 720.0f;
+    }
+    const int button_touch = (held & (HidNpadButton_A | HidNpadButton_ZR)) != 0;
+    if (button_touch && !physical) input->cursor_visible = 1;
+    const int wanted = physical || button_touch;
+    if (wanted && !input->active_touch)
+      send_touch(api, env, thiz, 0, x, y);
+    else if (wanted)
+      send_touch(api, env, thiz, 2, x, y);
+    else if (input->active_touch)
+      send_touch(api, env, thiz, 1, input->last_x, input->last_y);
+    input->active_touch = wanted;
+    if (wanted) {
+      input->last_x = x;
+      input->last_y = y;
+    }
+  } else {
+    /* controller passthrough mode: do not synthesize motion/touch. */
+    /* ensure cursor isn't visible and any synthetic touches are cleared above */
+    (void)sx; (void)sy; /* silence unused var warnings when building for some targets */
   }
 }
 
