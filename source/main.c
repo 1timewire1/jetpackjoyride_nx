@@ -780,7 +780,7 @@ static void input_init(InputState *input) {
   input->previous_ns = monotonic_ns();
   input->cursor_visible =
       appletGetOperationMode() == AppletOperationMode_Console;
-  input->mouse_mode = 1; /* default: keep existing on-screen cursor behavior; press ZL to toggle */
+  input->mouse_mode = 0; /* default: controller passthrough off -> on-screen cursor disabled; press ZL to toggle */
 }
 
 static void send_touch(const MortarApi *api, void *env, void *thiz, int action,
