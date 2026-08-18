@@ -750,6 +750,7 @@ typedef struct {
   uint64_t previous_ns;
   int cursor_visible;
   int mouse_mode; /* 1 = on-screen cursor active, 0 = full controller passthrough */
+  int prev_hat; /* bitmask of virtual dpad state: bit0=up, bit1=down, bit2=left, bit3=right */
 } InputState;
 
 typedef struct { uint64_t button; int android_key; } KeyBinding;
@@ -781,6 +782,7 @@ static void input_init(InputState *input) {
   input->cursor_visible =
       appletGetOperationMode() == AppletOperationMode_Console;
   input->mouse_mode = 0; /* default: controller passthrough off -> on-screen cursor disabled; press ZL to toggle */
+  input->prev_hat = 0;
 }
 
 static void send_touch(const MortarApi *api, void *env, void *thiz, int action,
@@ -874,9 +876,24 @@ static void input_update(InputState *input, const MortarApi *api,
       input->last_y = y;
     }
   } else {
-    /* controller passthrough mode: do not synthesize motion/touch. */
-    /* ensure cursor isn't visible and any synthetic touches are cleared above */
-    (void)sx; (void)sy; /* silence unused var warnings when building for some targets */
+    /* controller passthrough mode: map left analog stick to D-Pad for menu navigation */
+    const float hat_thresh = 0.5f;
+    int hat_up = (sy > hat_thresh) ? 1 : 0;
+    int hat_down = (sy < -hat_thresh) ? 1 : 0;
+    int hat_left = (sx < -hat_thresh) ? 1 : 0;
+    int hat_right = (sx > hat_thresh) ? 1 : 0;
+    int mask = (hat_up ? 1 : 0) | (hat_down ? 2 : 0) | (hat_left ? 4 : 0) | (hat_right ? 8 : 0);
+    int prev = input->prev_hat;
+    /* Android key codes: Up=19, Down=20, Left=21, Right=22 */
+    if ((mask & 1) && !(prev & 1)) api->key(env, thiz, 19, 1, 0, 0);
+    if (!(mask & 1) && (prev & 1)) api->key(env, thiz, 19, 0, 0, 0);
+    if ((mask & 2) && !(prev & 2)) api->key(env, thiz, 20, 1, 0, 0);
+    if (!(mask & 2) && (prev & 2)) api->key(env, thiz, 20, 0, 0, 0);
+    if ((mask & 4) && !(prev & 4)) api->key(env, thiz, 21, 1, 0, 0);
+    if (!(mask & 4) && (prev & 4)) api->key(env, thiz, 21, 0, 0, 0);
+    if ((mask & 8) && !(prev & 8)) api->key(env, thiz, 22, 1, 0, 0);
+    if (!(mask & 8) && (prev & 8)) api->key(env, thiz, 22, 0, 0, 0);
+    input->prev_hat = mask;
   }
 }
 
