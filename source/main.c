@@ -810,8 +810,8 @@ static void input_update(InputState *input, const MortarApi *api,
   }
 
   for (size_t i = 0; i < sizeof key_bindings / sizeof key_bindings[0]; ++i) {
-    /* skip ZL since it's used for toggling mouse mode */
-    if (key_bindings[i].button == HidNpadButton_ZL) continue;
+    /* skip ZL since it's used for toggling mouse mode; skip Minus because it simulates a bottom-center touch */
+    if (key_bindings[i].button == HidNpadButton_ZL || key_bindings[i].button == HidNpadButton_Minus) continue;
     if (down & key_bindings[i].button)
       api->key(env, thiz, key_bindings[i].android_key, 1, 0, 0);
     if (up & key_bindings[i].button)
@@ -827,6 +827,18 @@ static void input_update(InputState *input, const MortarApi *api,
   float sy = (float)stick.y / 32768.0f;
   if (sx > -0.14f && sx < 0.14f) sx = 0.0f;
   if (sy > -0.14f && sy < 0.14f) sy = 0.0f;
+
+  /* Minus / Select button: simulate touch at bottom-center regardless of mouse_mode. */
+  {
+    float minus_x = 0.5f;
+    float minus_y = (screen_height > 1) ? ((float)(screen_height - 1) / (float)screen_height) : 0.999f;
+    if (down & HidNpadButton_Minus) {
+      send_touch(api, env, thiz, 0, minus_x, minus_y);
+    }
+    if (up & HidNpadButton_Minus) {
+      send_touch(api, env, thiz, 1, minus_x, minus_y);
+    }
+  }
 
   if (input->mouse_mode) {
     if (sx != 0.0f || sy != 0.0f) input->cursor_visible = 1;
