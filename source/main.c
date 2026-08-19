@@ -842,6 +842,15 @@ static void input_update(InputState *input, const MortarApi *api,
     }
   }
 
+  int physical = 0;
+  float x = input->cursor_x, y = input->cursor_y;
+  if (hidGetTouchScreenStates(&input->touch_state, 1) > 0 &&
+      input->touch_state.count > 0) {
+    physical = 1;
+    x = (float)input->touch_state.touches[0].x / (float)screen_width;
+    y = (float)input->touch_state.touches[0].y / (float)screen_height;
+  }
+
   if (input->mouse_mode) {
     if (sx != 0.0f || sy != 0.0f) input->cursor_visible = 1;
     input->cursor_x += sx * dt * 0.75f;
@@ -852,14 +861,13 @@ static void input_update(InputState *input, const MortarApi *api,
     if (input->cursor_y > 1.0f) input->cursor_y = 1.0f;
     api->motion(env, thiz, 0, 0, sx, -sy);
 
-    int physical = 0;
-    float x = input->cursor_x, y = input->cursor_y;
-    if (hidGetTouchScreenStates(&input->touch_state, 1) > 0 &&
-        input->touch_state.count > 0) {
-      physical = 1;
+    if (physical) {
       input->cursor_visible = 0;
-      x = (float)input->touch_state.touches[0].x / 1280.0f;
-      y = (float)input->touch_state.touches[0].y / 720.0f;
+      x = (float)input->touch_state.touches[0].x / (float)screen_width;
+      y = (float)input->touch_state.touches[0].y / (float)screen_height;
+    } else {
+      x = input->cursor_x;
+      y = input->cursor_y;
     }
     const int button_touch = (held & (HidNpadButton_A | HidNpadButton_ZR)) != 0;
     if (button_touch && !physical) input->cursor_visible = 1;
@@ -876,7 +884,20 @@ static void input_update(InputState *input, const MortarApi *api,
       input->last_y = y;
     }
   } else {
-    /* controller passthrough mode: map left analog stick to D-Pad for menu navigation */
+    /* controller passthrough mode: keep actual touchscreen input active while mapping left analog stick to D-Pad */
+    if (physical) {
+      if (!input->active_touch)
+        send_touch(api, env, thiz, 0, x, y);
+      else
+        send_touch(api, env, thiz, 2, x, y);
+      input->active_touch = 1;
+      input->last_x = x;
+      input->last_y = y;
+    } else if (input->active_touch) {
+      send_touch(api, env, thiz, 1, input->last_x, input->last_y);
+      input->active_touch = 0;
+    }
+
     const float hat_thresh = 0.5f;
     int hat_up = (sy > hat_thresh) ? 1 : 0;
     int hat_down = (sy < -hat_thresh) ? 1 : 0;
