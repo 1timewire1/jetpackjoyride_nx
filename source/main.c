@@ -420,6 +420,37 @@ static bool offline_notification_permission(void) {
   return true;
 }
 
+/* Jetpack::TimeService normally confirms the device clock by POSTing to a
+ * Halfbrick endpoint and reading the UTC seconds it echoes back. Nothing
+ * else here calls out to the internet, so that round trip always times
+ * out, timeJJ::IsServerTimeReliable() stays false, and every feature that
+ * gates on it refuses to run: SAMRewardSystem's daily reset (Strong Arm
+ * Machine), DailyMissions::Sync, Game::UpdateDiscountedItems,
+ * Level::SetupNextBarryBotToken, TitleMenu::Update, notice-board/ad-
+ * mediation date checks, and more.
+ *
+ * This replaces TimeService::RequestTimeUpdate() (also reached through
+ * ForceUpdate()) with a synthetic reply: it fills in exactly the fields
+ * TimeService::OnDownloadResponse() would after a perfect, zero-latency
+ * HTTP 200 whose body is the current time -- using the console's own
+ * clock as the "server" answer instead of opening a socket. Everything
+ * downstream (IsReliable(), GetTime(), the periodic re-sync in Update())
+ * is untouched and keeps working exactly as designed. */
+static bool spoof_time_service_request_update(void *time_service) {
+  uint8_t *ts = (uint8_t *)time_service;
+  const int64_t now = (int64_t)time(NULL);
+
+  *(uint8_t *)(ts + 0xe8) = 0;    /* no request in flight */
+  *(uint8_t *)(ts + 0xd4) = 1;    /* reliable */
+  *(int64_t *)(ts + 0xd8) = 0;    /* accumulated drift */
+  *(int64_t *)(ts + 0xe0) = now;  /* local clock at "receipt" */
+  *(int64_t *)(ts + 0xf0) = now;  /* local clock at "request" */
+  *(int64_t *)(ts + 0xf8) = now;  /* corrected server epoch */
+  *(int32_t *)(ts + 0x100) = 0;   /* baseline offset (perfect sync) */
+  *(int32_t *)(ts + 0x104) = *(int32_t *)(ts + 0xd0); /* configured retry cadence */
+  return true;
+}
+
 typedef void *(*splash_game_get_fn)(void);
 typedef bool (*splash_load_content_fn)(void *game, int *state);
 typedef void (*splash_setup_text_fn)(void *splash);
@@ -584,6 +615,24 @@ static void install_offline_service_patches(void) {
                       sizeof expected_splash_update) != 0)
     fatal_error("Unsupported SplashScreens update code in libmortargame.so.");
   hook_arm64((uintptr_t)code, (uintptr_t)splash_update_with_cpu_boost);
+  armDCacheFlush(code, 4 * sizeof(*code));
+
+  /* Trust the console's own clock instead of failing the server-time sync;
+   * see spoof_time_service_request_update() for why. */
+  static const char time_service_request_update[] =
+      "_ZN7Jetpack11TimeService17RequestTimeUpdateEv";
+  static const uint32_t expected_time_service_request_update[] = {
+    UINT32_C(0xd10443ff), /* sub sp, sp, #0x110 */
+    UINT32_C(0xa90e7bfd), /* stp x29, x30, [sp, #0xe0] */
+    UINT32_C(0xa90f57fc), /* stp x28, x21, [sp, #0xf0] */
+    UINT32_C(0xa9104ff4), /* stp x20, x19, [sp, #0x100] */
+  };
+
+  code = (uint32_t *)so_find_addr(&mortar_mod, time_service_request_update);
+  if (!code || memcmp(code, expected_time_service_request_update,
+                      sizeof expected_time_service_request_update) != 0)
+    fatal_error("Unsupported TimeService code in libmortargame.so.");
+  hook_arm64((uintptr_t)code, (uintptr_t)spoof_time_service_request_update);
   armDCacheFlush(code, 4 * sizeof(*code));
 }
 
