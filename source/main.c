@@ -420,6 +420,37 @@ static bool offline_notification_permission(void) {
   return true;
 }
 
+/* Jetpack::TimeService normally confirms the device clock by POSTing to a
+ * Halfbrick endpoint and reading the UTC seconds it echoes back. Nothing
+ * else here calls out to the internet, so that round trip always times
+ * out, timeJJ::IsServerTimeReliable() stays false, and every feature that
+ * gates on it refuses to run: SAMRewardSystem's daily reset (Strong Arm
+ * Machine), DailyMissions::Sync, Game::UpdateDiscountedItems,
+ * Level::SetupNextBarryBotToken, TitleMenu::Update, notice-board/ad-
+ * mediation date checks, and more.
+ *
+ * This replaces TimeService::RequestTimeUpdate() (also reached through
+ * ForceUpdate()) with a synthetic reply: it fills in exactly the fields
+ * TimeService::OnDownloadResponse() would after a perfect, zero-latency
+ * HTTP 200 whose body is the current time -- using the console's own
+ * clock as the "server" answer instead of opening a socket. Everything
+ * downstream (IsReliable(), GetTime(), the periodic re-sync in Update())
+ * is untouched and keeps working exactly as designed. */
+static bool spoof_time_service_request_update(void *time_service) {
+  uint8_t *ts = (uint8_t *)time_service;
+  const int64_t now = (int64_t)time(NULL);
+
+  *(uint8_t *)(ts + 0xe8) = 0;    /* no request in flight */
+  *(uint8_t *)(ts + 0xd4) = 1;    /* reliable */
+  *(int64_t *)(ts + 0xd8) = 0;    /* accumulated drift */
+  *(int64_t *)(ts + 0xe0) = now;  /* local clock at "receipt" */
+  *(int64_t *)(ts + 0xf0) = now;  /* local clock at "request" */
+  *(int64_t *)(ts + 0xf8) = now;  /* corrected server epoch */
+  *(int32_t *)(ts + 0x100) = 0;   /* baseline offset (perfect sync) */
+  *(int32_t *)(ts + 0x104) = *(int32_t *)(ts + 0xd0); /* configured retry cadence */
+  return true;
+}
+
 typedef void *(*splash_game_get_fn)(void);
 typedef bool (*splash_load_content_fn)(void *game, int *state);
 typedef void (*splash_setup_text_fn)(void *splash);
@@ -585,6 +616,24 @@ static void install_offline_service_patches(void) {
     fatal_error("Unsupported SplashScreens update code in libmortargame.so.");
   hook_arm64((uintptr_t)code, (uintptr_t)splash_update_with_cpu_boost);
   armDCacheFlush(code, 4 * sizeof(*code));
+
+  /* Trust the console's own clock instead of failing the server-time sync;
+   * see spoof_time_service_request_update() for why. */
+  static const char time_service_request_update[] =
+      "_ZN7Jetpack11TimeService17RequestTimeUpdateEv";
+  static const uint32_t expected_time_service_request_update[] = {
+    UINT32_C(0xd10443ff), /* sub sp, sp, #0x110 */
+    UINT32_C(0xa90e7bfd), /* stp x29, x30, [sp, #0xe0] */
+    UINT32_C(0xa90f57fc), /* stp x28, x21, [sp, #0xf0] */
+    UINT32_C(0xa9104ff4), /* stp x20, x19, [sp, #0x100] */
+  };
+
+  code = (uint32_t *)so_find_addr(&mortar_mod, time_service_request_update);
+  if (!code || memcmp(code, expected_time_service_request_update,
+                      sizeof expected_time_service_request_update) != 0)
+    fatal_error("Unsupported TimeService code in libmortargame.so.");
+  hook_arm64((uintptr_t)code, (uintptr_t)spoof_time_service_request_update);
+  armDCacheFlush(code, 4 * sizeof(*code));
 }
 
 typedef struct {
@@ -749,6 +798,8 @@ typedef struct {
   float cursor_x, cursor_y;
   uint64_t previous_ns;
   int cursor_visible;
+  int mouse_mode; /* 1 = on-screen cursor active, 0 = full controller passthrough */
+  int prev_hat; /* bitmask of virtual dpad state: bit0=up, bit1=down, bit2=left, bit3=right */
 } InputState;
 
 typedef struct { uint64_t button; int android_key; } KeyBinding;
@@ -779,6 +830,8 @@ static void input_init(InputState *input) {
   input->previous_ns = monotonic_ns();
   input->cursor_visible =
       appletGetOperationMode() == AppletOperationMode_Console;
+  input->mouse_mode = 0; /* default: controller passthrough off -> on-screen cursor disabled; press ZL to toggle */
+  input->prev_hat = 0;
 }
 
 static void send_touch(const MortarApi *api, void *env, void *thiz, int action,
@@ -795,7 +848,21 @@ static void input_update(InputState *input, const MortarApi *api,
   const uint64_t down = padGetButtonsDown(&input->pad);
   const uint64_t up = padGetButtonsUp(&input->pad);
   const uint64_t held = padGetButtons(&input->pad);
+
+  /* ZL toggles on-screen mouse mode (edge-detect on press). Do not forward ZL as an android key. */
+  if (down & HidNpadButton_ZL) {
+    input->mouse_mode = !input->mouse_mode;
+    /* if disabling mouse mode, ensure any synthetic touch is released */
+    if (!input->mouse_mode && input->active_touch) {
+      send_touch(api, env, thiz, 1, input->last_x, input->last_y);
+      input->active_touch = 0;
+    }
+    if (!input->mouse_mode) input->cursor_visible = 0;
+  }
+
   for (size_t i = 0; i < sizeof key_bindings / sizeof key_bindings[0]; ++i) {
+    /* skip ZL since it's used for toggling mouse mode; skip Minus because it simulates a bottom-center touch */
+    if (key_bindings[i].button == HidNpadButton_ZL || key_bindings[i].button == HidNpadButton_Minus) continue;
     if (down & key_bindings[i].button)
       api->key(env, thiz, key_bindings[i].android_key, 1, 0, 0);
     if (up & key_bindings[i].button)
@@ -811,37 +878,92 @@ static void input_update(InputState *input, const MortarApi *api,
   float sy = (float)stick.y / 32768.0f;
   if (sx > -0.14f && sx < 0.14f) sx = 0.0f;
   if (sy > -0.14f && sy < 0.14f) sy = 0.0f;
-  if (sx != 0.0f || sy != 0.0f) input->cursor_visible = 1;
-  input->cursor_x += sx * dt * 0.75f;
-  input->cursor_y -= sy * dt * 0.75f;
-  if (input->cursor_x < 0.0f) input->cursor_x = 0.0f;
-  if (input->cursor_x > 1.0f) input->cursor_x = 1.0f;
-  if (input->cursor_y < 0.0f) input->cursor_y = 0.0f;
-  if (input->cursor_y > 1.0f) input->cursor_y = 1.0f;
-  api->motion(env, thiz, 0, 0, sx, -sy);
+
+  /* Minus / Select button: simulate touch at bottom-center regardless of mouse_mode. */
+  {
+    float minus_x = 0.5f;
+    float minus_y = (screen_height > 1) ? ((float)(screen_height - 1) / (float)screen_height) : 0.999f;
+    if (down & HidNpadButton_Minus) {
+      send_touch(api, env, thiz, 0, minus_x, minus_y);
+    }
+    if (up & HidNpadButton_Minus) {
+      send_touch(api, env, thiz, 1, minus_x, minus_y);
+    }
+  }
 
   int physical = 0;
   float x = input->cursor_x, y = input->cursor_y;
   if (hidGetTouchScreenStates(&input->touch_state, 1) > 0 &&
       input->touch_state.count > 0) {
     physical = 1;
-    input->cursor_visible = 0;
-    x = (float)input->touch_state.touches[0].x / 1280.0f;
-    y = (float)input->touch_state.touches[0].y / 720.0f;
+    x = (float)input->touch_state.touches[0].x / (float)screen_width;
+    y = (float)input->touch_state.touches[0].y / (float)screen_height;
   }
-  const int button_touch = (held & (HidNpadButton_A | HidNpadButton_ZR)) != 0;
-  if (button_touch && !physical) input->cursor_visible = 1;
-  const int wanted = physical || button_touch;
-  if (wanted && !input->active_touch)
-    send_touch(api, env, thiz, 0, x, y);
-  else if (wanted)
-    send_touch(api, env, thiz, 2, x, y);
-  else if (input->active_touch)
-    send_touch(api, env, thiz, 1, input->last_x, input->last_y);
-  input->active_touch = wanted;
-  if (wanted) {
-    input->last_x = x;
-    input->last_y = y;
+
+  if (input->mouse_mode) {
+    if (sx != 0.0f || sy != 0.0f) input->cursor_visible = 1;
+    input->cursor_x += sx * dt * 0.75f;
+    input->cursor_y -= sy * dt * 0.75f;
+    if (input->cursor_x < 0.0f) input->cursor_x = 0.0f;
+    if (input->cursor_x > 1.0f) input->cursor_x = 1.0f;
+    if (input->cursor_y < 0.0f) input->cursor_y = 0.0f;
+    if (input->cursor_y > 1.0f) input->cursor_y = 1.0f;
+    api->motion(env, thiz, 0, 0, sx, -sy);
+
+    if (physical) {
+      input->cursor_visible = 0;
+      x = (float)input->touch_state.touches[0].x / (float)screen_width;
+      y = (float)input->touch_state.touches[0].y / (float)screen_height;
+    } else {
+      x = input->cursor_x;
+      y = input->cursor_y;
+    }
+    const int button_touch = (held & (HidNpadButton_A | HidNpadButton_ZR)) != 0;
+    if (button_touch && !physical) input->cursor_visible = 1;
+    const int wanted = physical || button_touch;
+    if (wanted && !input->active_touch)
+      send_touch(api, env, thiz, 0, x, y);
+    else if (wanted)
+      send_touch(api, env, thiz, 2, x, y);
+    else if (input->active_touch)
+      send_touch(api, env, thiz, 1, input->last_x, input->last_y);
+    input->active_touch = wanted;
+    if (wanted) {
+      input->last_x = x;
+      input->last_y = y;
+    }
+  } else {
+    /* controller passthrough mode: keep actual touchscreen input active while mapping left analog stick to D-Pad */
+    if (physical) {
+      if (!input->active_touch)
+        send_touch(api, env, thiz, 0, x, y);
+      else
+        send_touch(api, env, thiz, 2, x, y);
+      input->active_touch = 1;
+      input->last_x = x;
+      input->last_y = y;
+    } else if (input->active_touch) {
+      send_touch(api, env, thiz, 1, input->last_x, input->last_y);
+      input->active_touch = 0;
+    }
+
+    const float hat_thresh = 0.5f;
+    int hat_up = (sy > hat_thresh) ? 1 : 0;
+    int hat_down = (sy < -hat_thresh) ? 1 : 0;
+    int hat_left = (sx < -hat_thresh) ? 1 : 0;
+    int hat_right = (sx > hat_thresh) ? 1 : 0;
+    int mask = (hat_up ? 1 : 0) | (hat_down ? 2 : 0) | (hat_left ? 4 : 0) | (hat_right ? 8 : 0);
+    int prev = input->prev_hat;
+    /* Android key codes: Up=19, Down=20, Left=21, Right=22 */
+    if ((mask & 1) && !(prev & 1)) api->key(env, thiz, 19, 1, 0, 0);
+    if (!(mask & 1) && (prev & 1)) api->key(env, thiz, 19, 0, 0, 0);
+    if ((mask & 2) && !(prev & 2)) api->key(env, thiz, 20, 1, 0, 0);
+    if (!(mask & 2) && (prev & 2)) api->key(env, thiz, 20, 0, 0, 0);
+    if ((mask & 4) && !(prev & 4)) api->key(env, thiz, 21, 1, 0, 0);
+    if (!(mask & 4) && (prev & 4)) api->key(env, thiz, 21, 0, 0, 0);
+    if ((mask & 8) && !(prev & 8)) api->key(env, thiz, 22, 1, 0, 0);
+    if (!(mask & 8) && (prev & 8)) api->key(env, thiz, 22, 0, 0, 0);
+    input->prev_hat = mask;
   }
 }
 
